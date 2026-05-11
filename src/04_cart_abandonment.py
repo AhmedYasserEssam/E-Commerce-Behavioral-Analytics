@@ -3,41 +3,82 @@ import os
 import re
 from datetime import datetime, timezone
 
-from pyspark.sql import SparkSession
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
-spark = SparkSession.builder \
-    .appName("CartAbandonmentRecovery") \
-    .config("spark.hadoop.dfs.client.use.datanode.hostname", "true") \
-    .config("spark.mongodb.read.connection.uri", "mongodb://localhost:27017") \
-    .config("spark.mongodb.read.database", "ecommerce_recommendation") \
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    ArrayType,
+    StringType,
+    StructField,
+    StructType,
+)
+
+
+HDFS_URI = os.getenv("HDFS_URI", "hdfs://localhost:9000").rstrip("/")
+
+INPUT_PATH = os.getenv(
+    "CART_ABANDON_INPUT",
+    f"{HDFS_URI}/user/hadoop/ecommerce_input/ecommerce_logs.csv",
+)
+
+OUTPUT_PATH = os.getenv(
+    "CART_ABANDON_OUTPUT",
+    f"{HDFS_URI}/user/hadoop/cart_abandonment_output",
+)
+
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DATABASE = os.getenv("MONGO_DATABASE", "ecommerce_recommendation")
+PROFILES_COLLECTION = os.getenv("PROFILES_COLLECTION", "user_profiles")
+
+TOP_N = int(os.getenv("TOP_N", "3"))
+GENERATED_AT = datetime.now(timezone.utc).isoformat()
+
+
+spark = (
+    SparkSession.builder
+    .appName("CartAbandonmentRecovery")
+    .config("spark.hadoop.dfs.client.use.datanode.hostname", "true")
     .getOrCreate()
+)
 
 sc = spark.sparkContext
 
-hdfs_uri = os.getenv("HDFS_URI", "hdfs://localhost:9000").rstrip("/")
 
-input_path = os.getenv(
-    "CART_ABANDON_INPUT",
-    f"{hdfs_uri}/user/hadoop/ecommerce_input/ecommerce_logs.csv",
-)
+def clean_string(value):
+    if value is None:
+        return None
 
-output_path = os.getenv(
-    "CART_ABANDON_OUTPUT",
-    f"{hdfs_uri}/user/hadoop/cart_abandonment_output",
-)
+    value = str(value).strip()
 
-profiles_collection = "user_profiles"
+    if value == "":
+        return None
 
-TOP_N = 3
+    return value
 
 
 def extract_category(log):
+    for field_name in [
+        "category",
+        "category_level_1",
+        "category_level_2",
+        "category_level_3",
+        "category_level_4",
+        "product_category",
+    ]:
+        value = clean_string(log.get(field_name))
+
+        if value:
+            return value
+
     metadata = log.get("product_metadata")
+
     if metadata in (None, ""):
         return None
 
     metadata = str(metadata).strip()
     normalized_metadata = metadata.replace('""', '"')
+
     if normalized_metadata.startswith('"') and normalized_metadata.endswith('"'):
         normalized_metadata = normalized_metadata[1:-1]
 
@@ -45,107 +86,227 @@ def extract_category(log):
         parsed = json.loads(normalized_metadata)
     except (TypeError, json.JSONDecodeError):
         match = re.search(r'"category"\s*:\s*"([^"]+)"', normalized_metadata)
-        return match.group(1) if match else None
 
-    if isinstance(parsed, dict):
-        return parsed.get("category")
+        if match:
+            return clean_string(match.group(1))
+
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    for field_name in [
+        "category",
+        "category_level_1",
+        "category_level_2",
+        "category_level_3",
+        "category_level_4",
+        "product_category",
+    ]:
+        value = clean_string(parsed.get(field_name))
+
+        if value:
+            return value
+
     return None
 
 
-# Read CSV (same options as 02_user_affinity.py)
-df = spark.read \
-    .option("header", True) \
-    .option("inferSchema", True) \
-    .option("quote", '"') \
-    .option("escape", '"') \
-    .csv(input_path)
+def event_to_session_record(log):
+    session_id = clean_string(log.get("session_id"))
+    user_id = clean_string(log.get("user_id"))
+    product_id = clean_string(log.get("product_id"))
 
-# Convert rows to dictionaries for RDD processing
-events_rdd = df.rdd.map(lambda row: row.asDict())
+    event_type = clean_string(log.get("event_type"))
 
-# 1) Map each event to (session_id, (user_id, product_id, event_type, category))
-session_events = events_rdd.map(
-    lambda log: (
-        log.get("session_id"),
-        (
-            log.get("user_id"),
-            log.get("product_id"),
-            str(log.get("event_type")).lower() if log.get("event_type") else None,
-            extract_category(log),
-        )
+    if event_type:
+        event_type = event_type.lower()
+
+    category = extract_category(log)
+
+    return (
+        session_id,
+        {
+            "user_id": user_id,
+            "product_id": product_id,
+            "event_type": event_type,
+            "category": category,
+        },
     )
-).filter(
-    lambda kv: kv[0] not in (None, "")
-    and kv[1][0] not in (None, "")
-    and kv[1][1] not in (None, "")
-    and kv[1][2] not in (None, "")
-)
 
-print("Sample session_events:")
-print(session_events.take(5))
 
-# 2) Group all events of each session together
-session_grouped = session_events.groupByKey().mapValues(list)
+def is_valid_session_event(kv):
+    session_id, event = kv
 
-# 3) Keep only abandoned sessions:
-#    a session that has at least one 'cart' event and zero 'purchase' events
-def is_abandoned(events):
-    event_types = {e[2] for e in events}
-    return "cart" in event_types and "purchase" not in event_types
+    return (
+        session_id is not None
+        and event["user_id"] is not None
+        and event["product_id"] is not None
+        and event["event_type"] is not None
+    )
 
-abandoned_sessions = session_grouped.filter(
-    lambda kv: is_abandoned(kv[1])
-)
 
-print(f"Abandoned sessions: {abandoned_sessions.count()}")
+def create_session_accumulator(event):
+    is_cart = event["event_type"] == "cart"
+    is_purchase = event["event_type"] == "purchase"
 
-# 4) From each abandoned session, keep only its cart items
-#    Output: (user_id, (session_id, product_id, category))
-abandoned_cart_items = abandoned_sessions.flatMap(
-    lambda kv: [
-        (event[0], (kv[0], event[1], event[3]))
-        for event in kv[1]
-        if event[2] == "cart" and event[3] not in (None, "")
+    cart_items = []
+
+    if is_cart and event["category"] is not None:
+        cart_items.append(
+            (
+                event["user_id"],
+                event["product_id"],
+                event["category"],
+            )
+        )
+
+    return {
+        "has_cart": is_cart,
+        "has_purchase": is_purchase,
+        "cart_items": cart_items,
+    }
+
+
+def merge_session_value(accumulator, event):
+    is_cart = event["event_type"] == "cart"
+    is_purchase = event["event_type"] == "purchase"
+
+    accumulator["has_cart"] = accumulator["has_cart"] or is_cart
+    accumulator["has_purchase"] = accumulator["has_purchase"] or is_purchase
+
+    if is_cart and event["category"] is not None:
+        accumulator["cart_items"].append(
+            (
+                event["user_id"],
+                event["product_id"],
+                event["category"],
+            )
+        )
+
+    return accumulator
+
+
+def merge_session_accumulators(left, right):
+    return {
+        "has_cart": left["has_cart"] or right["has_cart"],
+        "has_purchase": left["has_purchase"] or right["has_purchase"],
+        "cart_items": left["cart_items"] + right["cart_items"],
+    }
+
+
+def is_abandoned_session(session_record):
+    return (
+        session_record["has_cart"]
+        and not session_record["has_purchase"]
+        and len(session_record["cart_items"]) > 0
+    )
+
+
+def extract_abandoned_cart_items(kv):
+    session_id, session_record = kv
+
+    return [
+        (
+            user_id,
+            (
+                session_id,
+                product_id,
+                category,
+            ),
+        )
+        for user_id, product_id, category in session_record["cart_items"]
     ]
-).distinct()
 
-print(f"Abandoned cart items: {abandoned_cart_items.count()}")
-print("Sample abandoned cart items:")
-print(abandoned_cart_items.take(5))
 
-# 5) Load user profiles from MongoDB via the Spark connector
-profiles_df = spark.read \
-    .format("mongodb") \
-    .option("collection", profiles_collection) \
-    .load() \
-    .select("user_id", "top_categories")
+def get_nested_value(value, field_name):
+    if value is None:
+        return None
 
-# 6) Convert profiles to an RDD of (user_id, [top N category names])
+    if isinstance(value, dict):
+        return value.get(field_name)
+
+    try:
+        return value[field_name]
+    except Exception:
+        pass
+
+    return getattr(value, field_name, None)
+
+
 def top_n_categories(top_categories):
     if not top_categories:
         return []
-    sorted_cats = sorted(top_categories, key=lambda c: c["rank"])
-    return [c["category"] for c in sorted_cats[:TOP_N]]
 
-user_top_categories = profiles_df.rdd.map(
-    lambda row: (row["user_id"], top_n_categories(row["top_categories"]))
-)
+    cleaned_categories = []
 
-print("Sample user_top_categories:")
-print(user_top_categories.take(5))
+    for category_record in top_categories:
+        category = get_nested_value(category_record, "category")
+        rank = get_nested_value(category_record, "rank")
 
-# 7) Join abandoned cart items with user top categories
-#    Use leftOuterJoin so users without a profile still get a row
-joined = abandoned_cart_items.leftOuterJoin(user_top_categories)
+        if category is None:
+            continue
 
-# 8) Flag each row:
-#    High_Discount     -> abandoned category is in user's top N
-#    Standard_Reminder -> otherwise (or user has no profile)
-def flag_row(kv):
-    user_id, (cart_info, top_cats) = kv
-    session_id, product_id, category = cart_info
+        try:
+            rank = int(rank)
+        except (TypeError, ValueError):
+            rank = 999999
 
-    if top_cats and category in top_cats:
+        cleaned_categories.append(
+            {
+                "category": str(category),
+                "rank": rank,
+            }
+        )
+
+    cleaned_categories.sort(key=lambda item: (item["rank"], item["category"]))
+
+    return [
+        item["category"]
+        for item in cleaned_categories[:TOP_N]
+    ]
+
+
+def load_user_top_categories():
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+
+    try:
+        collection = client[MONGO_DATABASE][PROFILES_COLLECTION]
+        profiles = {}
+
+        for document in collection.find(
+            {},
+            {
+                "_id": 0,
+                "user_id": 1,
+                "top_categories": 1,
+            },
+        ):
+            user_id = clean_string(document.get("user_id"))
+
+            if user_id is None:
+                continue
+
+            profiles[user_id] = top_n_categories(document.get("top_categories"))
+
+        return profiles
+
+    except PyMongoError as exc:
+        raise RuntimeError(
+            "Could not load MongoDB user profiles. "
+            "Phase 3 requires MongoDB user_profiles data."
+        ) from exc
+
+    finally:
+        client.close()
+
+
+def flag_row(row):
+    user_id, cart_info = row
+    session_id, product_id, abandoned_category = cart_info
+
+    top_categories = user_top_categories_broadcast.value.get(user_id, [])
+
+    if top_categories and abandoned_category in top_categories:
         flag = "High_Discount"
     else:
         flag = "Standard_Reminder"
@@ -154,38 +315,124 @@ def flag_row(kv):
         "user_id": user_id,
         "session_id": session_id,
         "product_id": product_id,
-        "abandoned_category": category,
-        "user_top_categories": top_cats if top_cats else [],
+        "abandoned_category": abandoned_category,
+        "user_top_categories": top_categories,
         "flag": flag,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": GENERATED_AT,
     }
 
-flagged_rdd = joined.map(flag_row)
 
-# 9) Print flag distribution
-flag_counts = flagged_rdd.map(lambda r: (r["flag"], 1)).reduceByKey(lambda a, b: a + b)
+output_schema = StructType(
+    [
+        StructField("user_id", StringType(), True),
+        StructField("session_id", StringType(), True),
+        StructField("product_id", StringType(), True),
+        StructField("abandoned_category", StringType(), True),
+        StructField("user_top_categories", ArrayType(StringType()), True),
+        StructField("flag", StringType(), True),
+        StructField("generated_at", StringType(), True),
+    ]
+)
+
+
+df = (
+    spark.read
+    .option("header", True)
+    .option("inferSchema", False)
+    .option("quote", '"')
+    .option("escape", '"')
+    .csv(INPUT_PATH)
+)
+
+required_columns = {
+    "session_id",
+    "user_id",
+    "product_id",
+    "event_type",
+}
+
+missing_columns = required_columns - set(df.columns)
+
+if missing_columns:
+    raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
+
+print("Input columns:")
+print(df.columns)
+
+events_rdd = df.rdd.map(lambda row: row.asDict(recursive=True))
+
+session_events = (
+    events_rdd
+    .map(event_to_session_record)
+    .filter(is_valid_session_event)
+)
+
+print("Sample session events:")
+print(session_events.take(5))
+
+session_summaries = session_events.combineByKey(
+    create_session_accumulator,
+    merge_session_value,
+    merge_session_accumulators,
+)
+
+abandoned_sessions = session_summaries.filter(
+    lambda kv: is_abandoned_session(kv[1])
+)
+
+abandoned_sessions = abandoned_sessions.persist()
+
+abandoned_session_count = abandoned_sessions.count()
+print(f"Abandoned sessions: {abandoned_session_count}")
+
+abandoned_cart_items = (
+    abandoned_sessions
+    .flatMap(extract_abandoned_cart_items)
+    .distinct()
+    .persist()
+)
+
+abandoned_cart_item_count = abandoned_cart_items.count()
+print(f"Abandoned cart items: {abandoned_cart_item_count}")
+
+print("Sample abandoned cart items:")
+print(abandoned_cart_items.take(5))
+
+profiles_by_user = load_user_top_categories()
+print(f"Loaded user profiles from MongoDB: {len(profiles_by_user)}")
+
+print("Sample user top categories:")
+print(list(profiles_by_user.items())[:5])
+
+user_top_categories_broadcast = sc.broadcast(profiles_by_user)
+
+flagged_rdd = abandoned_cart_items.map(flag_row).persist()
+
+flag_counts = flagged_rdd.map(
+    lambda row: (row["flag"], 1)
+).reduceByKey(
+    lambda left, right: left + right
+)
+
 print("Flag distribution:")
 for flag, count in flag_counts.collect():
     print(f"  {flag}: {count}")
 
-# 10) Remove any previous output directory before writing
-output_hdfs_path = spark._jvm.org.apache.hadoop.fs.Path(output_path)
-output_uri = spark._jvm.java.net.URI.create(output_path)
-fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    output_uri,
-    sc._jsc.hadoopConfiguration()
-)
-if fs.exists(output_hdfs_path):
-    fs.delete(output_hdfs_path, True)
-
-# 11) Write output as JSON files to HDFS
-flagged_df = spark.createDataFrame(flagged_rdd)
+if flagged_rdd.isEmpty():
+    flagged_df = spark.createDataFrame([], output_schema)
+else:
+    flagged_df = spark.createDataFrame(flagged_rdd, schema=output_schema)
 
 print("Sample output rows:")
 flagged_df.show(10, truncate=False)
 
-flagged_df.write.mode("overwrite").json(output_path)
+(
+    flagged_df
+    .write
+    .mode("overwrite")
+    .json(OUTPUT_PATH)
+)
 
-print(f"Cart abandonment targeting list written to: {output_path}")
+print(f"Cart abandonment targeting list written to: {OUTPUT_PATH}")
 
 spark.stop()
