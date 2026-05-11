@@ -117,7 +117,6 @@ Instant recommendation lookup by user_id and item_id
 |   |-- 03_load_to_mongodb.py
 |   |-- 04_cart_abandonment.py
 |   `-- 05_query_demo_script.py
-|-- HADOOP_HDFS_DATA_LOADING_GUIDE.md
 |-- requirements.txt
 `-- README.md
 ```
@@ -130,6 +129,24 @@ Expected local dataset path:
 
 ```text
 data/raw/ecommerce_logs.csv
+```
+
+Download the dataset from:
+
+```text
+https://drive.google.com/drive/folders/1MQKAUk6lZ82Naxpz3YqZAWwnP9pQJPmr?usp=drive_link
+```
+
+Place the downloaded CSV file in:
+
+```text
+data/raw/
+```
+
+The project expects the file to be named:
+
+```text
+ecommerce_logs.csv
 ```
 
 Expected HDFS dataset path:
@@ -160,7 +177,7 @@ Important fields used by the jobs:
 | `product_id` | Identifies items for product-pair analysis. |
 | `product_metadata` | Used to extract product category information. |
 
-> The raw dataset is intentionally not committed to GitHub if it is large. Place it under `data/raw/ecommerce_logs.csv` locally, then load it into HDFS.
+> The raw dataset is intentionally not committed to GitHub if it is large. Download it from the Google Drive link above, place it under `data/raw/ecommerce_logs.csv` locally, then load it into HDFS.
 
 ---
 
