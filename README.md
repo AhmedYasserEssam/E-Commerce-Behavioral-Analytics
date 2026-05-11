@@ -1,23 +1,109 @@
-# E-Commerce Behavioral Analytics
+# E-Commerce Behavioral Analytics & Recommendation Engine
 
-This project analyzes e-commerce clickstream behavior with a local Hadoop/Spark workflow and stores recommendation-ready results in MongoDB.
+End-to-end big data pipeline for analyzing e-commerce clickstream behavior, generating recommendation signals with Spark, storing recommendation-ready profiles in MongoDB, and producing cart-abandonment targeting output for marketing actions.
 
-The main work completed so far is:
+The project uses a local Dockerized Hadoop/HDFS environment, PySpark jobs for distributed processing, and MongoDB for low-latency recommendation lookup.
 
-- Set up a local Hadoop Docker cluster.
-- Loaded the raw e-commerce log dataset into HDFS.
-- Built a Spark market basket analysis job.
-- Built a Spark user affinity aggregation job.
-- Built a Spark user source-items job for denormalized recommendations.
-- Stored Spark outputs in HDFS for ingestion.
-- Added MongoDB with Docker Compose.
-- Loaded the processed analytics output into MongoDB collections.
+---
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Dataset](#dataset)
+- [Pipeline Phases](#pipeline-phases)
+- [MongoDB Schema](#mongodb-schema)
+- [How to Run](#how-to-run)
+- [Query Demo](#query-demo)
+- [Cart Abandonment Results](#cart-abandonment-results)
+- [Useful HDFS Checks](#useful-hdfs-checks)
+- [Current Status](#current-status)
+
+---
+
+## Project Overview
+
+This project processes large e-commerce behavior logs to produce two main outputs:
+
+1. **Recommendation profiles**
+   - Top product categories per user.
+   - Product co-occurrence recommendations based on market basket analysis.
+   - Denormalized MongoDB documents for single-query lookup.
+
+2. **Cart abandonment targeting output**
+   - Detects cart items from sessions with cart activity but no purchase.
+   - Joins abandoned items with each user's top categories.
+   - Flags users for either `High_Discount` or `Standard_Reminder` recovery actions.
+
+The pipeline is designed around distributed processing because the raw dataset is too large for ordinary in-memory processing with single-machine loops or Pandas.
+
+---
+
+## Architecture
+
+```text
+Raw ecommerce_logs.csv
+        |
+        v
+Dockerized Hadoop / HDFS
+        |
+        v
++-----------------------------+
+| PySpark Distributed Jobs    |
+|-----------------------------|
+| 01_market_basket.py         |
+| 02_user_affinity.py         |
+| 03a_build_user_source_items |
+| 04_cart_abandonment.py      |
++-----------------------------+
+        |
+        v
+HDFS Output Directories
+        |
+        v
+MongoDB Ingestion
+03_load_to_mongodb.py
+        |
+        v
+MongoDB Database
+        |
+        +--> user_profiles
+        |       - top_categories
+        |       - co_occurrence_recommendations
+        |
+        +--> market_basket_pairs
+                - global product-pair counts
+        |
+        v
+05_query_demo_script.py
+Instant recommendation lookup by user_id and item_id
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+| --- | --- |
+| Distributed storage | Hadoop HDFS |
+| Distributed processing | Apache Spark / PySpark |
+| Containerization | Docker, Docker Compose |
+| NoSQL database | MongoDB |
+| Database client | PyMongo |
+| Language | Python |
+| Output formats | HDFS text output, HDFS JSON output, MongoDB documents |
+
+---
 
 ## Project Structure
 
 ```text
 .
-|-- data/raw/ecommerce_logs.csv
+|-- data/
+|   `-- raw/
+|       `-- ecommerce_logs.csv
 |-- docker-compose.mongo.yml
 |-- docker-hadoop/
 |   |-- docker-compose.yml
@@ -29,64 +115,60 @@ The main work completed so far is:
 |   |-- 02_user_affinity.py
 |   |-- 03a_build_user_source_items_spark.py
 |   |-- 03_load_to_mongodb.py
-|   `-- 04_cart_abandonment.py
+|   |-- 04_cart_abandonment.py
+|   `-- 05_query_demo_script.py
 |-- HADOOP_HDFS_DATA_LOADING_GUIDE.md
-`-- requirements.txt
+|-- requirements.txt
+`-- README.md
 ```
+
+---
 
 ## Dataset
 
-The input dataset is stored at:
+Expected local dataset path:
 
 ```text
 data/raw/ecommerce_logs.csv
 ```
 
-It contains e-commerce behavior events with these columns:
-
-```text
-timestamp, session_id, user_id, event_type, product_id, price, referrer, user_metadata, product_metadata
-```
-
-The important fields used by the current analytics jobs are:
-
-- `session_id`: groups activity into shopping sessions.
-- `user_id`: identifies the user for personalization.
-- `event_type`: includes events such as `view`, `cart`, and `purchase`.
-- `product_id`: identifies products for market basket analysis.
-- `product_metadata`: contains product details such as category.
-
-## Hadoop and HDFS Setup
-
-The Hadoop cluster is managed from the `docker-hadoop` directory.
-
-The dataset was loaded from local disk into HDFS at:
+Expected HDFS dataset path:
 
 ```text
 /user/hadoop/ecommerce_input/ecommerce_logs.csv
 ```
 
-Spark reads the file through:
+Spark reads the dataset from:
 
 ```text
 hdfs://localhost:9000/user/hadoop/ecommerce_input/ecommerce_logs.csv
 ```
 
-The detailed HDFS setup and troubleshooting notes are documented in:
+Expected columns:
 
 ```text
-HADOOP_HDFS_DATA_LOADING_GUIDE.md
+timestamp, session_id, user_id, event_type, product_id, price, referrer, user_metadata, product_metadata
 ```
 
-Important Hadoop/Spark configuration work completed:
+Important fields used by the jobs:
 
-- Exposed the NameNode web UI on `localhost:9870`.
-- Used HDFS RPC on `localhost:9000` for Spark reads.
-- Exposed DataNode ports needed by Spark running outside Docker.
-- Set `spark.hadoop.dfs.client.use.datanode.hostname=true` in the Spark jobs.
-- Adjusted Hadoop configuration so DataNode access works from the host machine.
+| Field | Purpose |
+| --- | --- |
+| `session_id` | Groups events into shopping sessions. |
+| `user_id` | Identifies users for personalization. |
+| `event_type` | Supports behavior weighting: `view`, `cart`, `purchase`. |
+| `product_id` | Identifies items for product-pair analysis. |
+| `product_metadata` | Used to extract product category information. |
 
-## Spark Job 1: Market Basket Analysis
+> The raw dataset is intentionally not committed to GitHub if it is large. Place it under `data/raw/ecommerce_logs.csv` locally, then load it into HDFS.
+
+---
+
+## Pipeline Phases
+
+### Phase 1 — Distributed Processing with Spark
+
+#### Job 1: Market Basket Analysis
 
 File:
 
@@ -98,38 +180,34 @@ Purpose:
 
 Find products that are purchased together in the same session.
 
-What the job does:
+Processing logic:
 
-1. Reads `ecommerce_logs.csv` from HDFS.
-2. Keeps only rows where `event_type` is `purchase`.
-3. Maps each purchase to `(session_id, product_id)`.
-4. Groups unique purchased products by session.
-5. Generates unordered product pairs per session.
-6. Counts how often each product pair appears globally.
-7. Sorts product pairs by frequency.
-8. Saves the output to HDFS.
+1. Read `ecommerce_logs.csv` from HDFS.
+2. Keep only `purchase` events.
+3. Map each purchase to `(session_id, product_id)`.
+4. Group unique purchased products by session.
+5. Generate unordered product pairs per session.
+6. Count global frequency for each product pair.
+7. Sort product pairs by frequency.
+8. Save the output to HDFS.
 
-HDFS output path:
+HDFS output:
 
 ```text
 hdfs://localhost:9000/user/hadoop/market_basket_output
 ```
 
-Optional local exported output:
-
-```text
-docker-hadoop/market_basket_output.txt
-```
-
-Example output format:
+Example output:
 
 ```text
 (('ITEM_1116', 'ITEM_4826'), 2)
 ```
 
-This means `ITEM_1116` and `ITEM_4826` were purchased together in two sessions.
+Meaning: `ITEM_1116` and `ITEM_4826` were purchased together in two sessions.
 
-## Spark Job 2: User Affinity Aggregation
+---
+
+#### Job 2: User Affinity Aggregation
 
 File:
 
@@ -139,47 +217,42 @@ src/02_user_affinity.py
 
 Purpose:
 
-Create user preference profiles by scoring each user's interaction with product categories.
+Build a behavioral profile for each user by scoring interactions with product categories.
 
-What the job does:
+Event weights:
 
-1. Reads `ecommerce_logs.csv` from HDFS.
-2. Parses the JSON-like `product_metadata` field.
-3. Extracts each product's category.
-4. Scores events with these weights:
+| Event | Weight |
+| --- | ---: |
+| `view` | 1 |
+| `cart` | 3 |
+| `purchase` | 5 |
 
-```text
-view = 1
-cart = 3
-purchase = 5
-```
+Processing logic:
 
-5. Aggregates scores by `(user_id, category)`.
-6. Groups category scores per user.
-7. Sorts each user's categories from highest score to lowest score.
-8. Saves the output to HDFS.
+1. Read `ecommerce_logs.csv` from HDFS.
+2. Parse `product_metadata`.
+3. Extract product category.
+4. Assign weighted event scores.
+5. Aggregate scores by `(user_id, category)`.
+6. Group category scores per user.
+7. Sort categories from highest score to lowest score.
+8. Save the output to HDFS.
 
-HDFS output path:
+HDFS output:
 
 ```text
 hdfs://localhost:9000/user/hadoop/user_affinity_output
 ```
 
-Optional local exported output:
-
-```text
-docker-hadoop/user_affinity_output.txt
-```
-
-Example output format:
+Example output:
 
 ```text
 ('User_12762', [('Clothing', 121), ('Toys', 120), ('Home', 109), ('Books', 103), ('Electronics', 94)])
 ```
 
-This means `User_12762` has the strongest affinity for `Clothing`, followed by `Toys`, `Home`, `Books`, and `Electronics`.
+---
 
-## Spark Job 3: User Source Items
+#### Job 3: User Source Items
 
 File:
 
@@ -189,31 +262,32 @@ src/03a_build_user_source_items_spark.py
 
 Purpose:
 
-Build the per-user source item list used to embed product co-occurrence recommendations into each MongoDB user profile.
+Create each user's strongest cart/purchase item list. These items are later used to embed product co-occurrence recommendations into the user's MongoDB profile.
 
-What the job does:
+Event weights:
 
-1. Reads `ecommerce_logs.csv` from HDFS.
-2. Keeps valid `user_id`, `product_id`, and `event_type` values.
-3. Scores product events with these weights:
+| Event | Weight |
+| --- | ---: |
+| `cart` | 1 |
+| `purchase` | 2 |
 
-```text
-cart = 1
-purchase = 2
-```
+Processing logic:
 
-4. Aggregates product scores by `(user_id, product_id)`.
-5. Ranks each user's strongest cart/purchase items.
-6. Keeps up to 20 source items per user.
-7. Saves the result as JSON to HDFS.
+1. Read `ecommerce_logs.csv` from HDFS.
+2. Keep valid `user_id`, `product_id`, and `event_type` values.
+3. Score cart and purchase events.
+4. Aggregate scores by `(user_id, product_id)`.
+5. Rank each user's strongest source items.
+6. Keep up to 20 source items per user.
+7. Save JSON output to HDFS.
 
-HDFS output path:
+HDFS output:
 
 ```text
 hdfs://localhost:9000/user/hadoop/user_source_items_output
 ```
 
-Example output format:
+Example output:
 
 ```json
 {
@@ -222,87 +296,11 @@ Example output format:
 }
 ```
 
-These source items are used during MongoDB ingestion to choose which market-basket co-occurrence recommendations should be embedded into that user's document.
+---
 
-## MongoDB Storage
+### Phase 2 — NoSQL Data Modeling and MongoDB Ingestion
 
-MongoDB is configured in:
-
-```text
-docker-compose.mongo.yml
-```
-
-The MongoDB container uses:
-
-```text
-container: ecommerce_mongo
-port: 27017
-database: ecommerce_recommendation
-```
-
-Start MongoDB with:
-
-```powershell
-docker compose -f docker-compose.mongo.yml up -d
-```
-
-## Tasks 2.1 and 2.2 Requirement Coverage
-
-Requirement:
-
-```text
-Design a denormalized document schema. Embed top categories and co-occurrence data directly into user documents for single-query retrieval.
-```
-
-Implemented option:
-
-```text
-Option A: MongoDB
-```
-
-How this project satisfies the requirement:
-
-- The main real-time lookup collection is `ecommerce_recommendation.user_profiles`.
-- Each user profile document embeds `top_categories` directly inside the user document.
-- Each user profile document embeds `co_occurrence_recommendations` directly inside the user document.
-- The frontend or recommendation API can retrieve a complete recommendation profile with one query by `_id` or `user_id`.
-- The separate `market_basket_pairs` collection is retained as a global co-occurrence source, but the user-specific recommendation subset is embedded into `user_profiles` for low-latency reads.
-
-Single-query retrieval example:
-
-```javascript
-db.user_profiles.findOne({ _id: "User_12762" })
-```
-
-That single lookup returns both category affinity data and product co-occurrence recommendations:
-
-```json
-{
-  "_id": "User_12762",
-  "user_id": "User_12762",
-  "top_categories": [
-    {
-      "category": "Clothing",
-      "score": 121,
-      "rank": 1
-    }
-  ],
-  "co_occurrence_recommendations": [
-    {
-      "source_item": "ITEM_1116",
-      "co_items": [
-        {
-          "item": "ITEM_4826",
-          "count": 2
-        }
-      ]
-    }
-  ],
-  "updated_at": "2026-05-11T00:00:00Z"
-}
-```
-
-## MongoDB Ingestion
+#### MongoDB Ingestion
 
 File:
 
@@ -312,35 +310,127 @@ src/03_load_to_mongodb.py
 
 Purpose:
 
-Load the Spark results from HDFS into MongoDB so they can be queried by a recommendation system or analytics dashboard.
+Load Spark outputs from HDFS into MongoDB and create recommendation-ready documents.
 
-What the script does:
-
-- Reads `/user/hadoop/market_basket_output/part-*` from HDFS.
-- Reads `/user/hadoop/user_affinity_output/part-*` from HDFS.
-- Reads `/user/hadoop/user_source_items_output/part-*` from HDFS.
-- Parses tuple-style Spark output with `ast.literal_eval`.
-- Parses user source-item JSON output with `json.loads`.
-- Uses bulk upserts for efficient MongoDB writes.
-- Embeds category affinity and product co-occurrence recommendations directly into each user profile document.
-- Adds `updated_at` timestamps.
-- Creates useful indexes after ingestion.
-
-Note:
-The Spark output files provide the category affinity scores, global product co-occurrence counts, and per-user source items. MongoDB ingestion reads those HDFS outputs and embeds the correct user-specific co-occurrence subset into each user document.
-
-Collections created:
+The script reads:
 
 ```text
-user_profiles
-market_basket_pairs
+/user/hadoop/market_basket_output/part-*
+/user/hadoop/user_affinity_output/part-*
+/user/hadoop/user_source_items_output/part-*
 ```
 
-### Denormalized User Schema: `user_profiles`
+The script writes to:
 
-Each document stores one user's ranked category interests and embedded co-occurrence recommendations. This supports single-query retrieval because the application can fetch one user document and get both personalization signals together.
+```text
+ecommerce_recommendation.user_profiles
+ecommerce_recommendation.market_basket_pairs
+```
 
-Collection:
+What the ingestion script does:
+
+- Parses tuple-style Spark output with `ast.literal_eval`.
+- Parses user source-item JSON output with `json.loads`.
+- Uses MongoDB bulk upserts.
+- Embeds top categories inside each user document.
+- Embeds user-specific co-occurrence recommendations inside each user document.
+- Creates indexes for faster lookup.
+
+---
+
+### Phase 3 — Cart Abandonment Recovery
+
+File:
+
+```text
+src/04_cart_abandonment.py
+```
+
+Purpose:
+
+Detect abandoned cart items and decide whether each item should receive a high-discount recovery action or a standard reminder.
+
+Processing logic:
+
+1. Read `ecommerce_logs.csv` from HDFS.
+2. Parse product categories from metadata.
+3. Summarize each session with:
+
+```text
+has_cart
+has_purchase
+cart_items
+```
+
+4. Keep sessions where:
+
+```text
+has_cart = true
+has_purchase = false
+cart_items is not empty
+```
+
+5. Extract abandoned cart items.
+6. Load `user_profiles.top_categories` from MongoDB.
+7. Broadcast the user-category map to Spark workers.
+8. Assign recovery flags:
+
+```text
+High_Discount     = abandoned category appears in the user's top 3 categories
+Standard_Reminder = abandoned category is outside the user's top 3 categories
+```
+
+9. Save the targeting output as JSON files in HDFS.
+
+HDFS output:
+
+```text
+hdfs://localhost:9000/user/hadoop/cart_abandonment_output
+```
+
+Example output:
+
+```json
+{
+  "user_id": "User_21974",
+  "session_id": "SESS_c66d345f0c",
+  "product_id": "ITEM_2083",
+  "abandoned_category": "Toys",
+  "user_top_categories": ["Toys", "Books", "Home"],
+  "flag": "High_Discount",
+  "generated_at": "2026-05-11T21:39:06.882311+00:00"
+}
+```
+
+---
+
+## MongoDB Schema
+
+MongoDB database:
+
+```text
+ecommerce_recommendation
+```
+
+MongoDB container:
+
+```text
+ecommerce_mongo
+```
+
+MongoDB port:
+
+```text
+27017
+```
+
+---
+
+### Collection 1: `user_profiles`
+
+This is the main real-time recommendation collection. Each document stores one user's category preferences and embedded product co-occurrence recommendations.
+
+Collection name:
 
 ```text
 ecommerce_recommendation.user_profiles
@@ -348,29 +438,29 @@ ecommerce_recommendation.user_profiles
 
 Schema:
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `_id` | string | Yes | MongoDB primary key. Uses the same value as `user_id`. |
-| `user_id` | string | Yes | User identifier from the source event logs. |
-| `top_categories` | array<object> | Yes | Ranked list of category affinity scores for the user. |
-| `top_categories.category` | string | Yes | Product category name, such as `Books`, `Electronics`, or `Home`. |
-| `top_categories.score` | int | Yes | Total weighted affinity score for this user/category pair. |
-| `top_categories.rank` | int | Yes | Rank of the category for the user, where `1` is the strongest affinity. |
-| `co_occurrence_recommendations` | array<object> | Yes | Embedded product co-occurrence recommendations based on the user's cart and purchase items. |
-| `co_occurrence_recommendations.source_item` | string | Yes | User item used as the recommendation seed. |
-| `co_occurrence_recommendations.co_items` | array<object> | Yes | Items frequently purchased with the source item. |
-| `co_occurrence_recommendations.co_items.item` | string | Yes | Recommended product ID. |
-| `co_occurrence_recommendations.co_items.count` | int | Yes | Number of purchase sessions where the source item and recommended item appeared together. |
-| `updated_at` | date | Yes | UTC timestamp for when the profile was last loaded into MongoDB. |
+| Field | Type | Description |
+| --- | --- | --- |
+| `_id` | string | MongoDB primary key. Same value as `user_id`. |
+| `user_id` | string | User identifier from the event log. |
+| `top_categories` | array<object> | Ranked category affinity scores. |
+| `top_categories.category` | string | Product category name. |
+| `top_categories.score` | int | Total weighted score for the category. |
+| `top_categories.rank` | int | Category rank for the user. |
+| `co_occurrence_recommendations` | array<object> | Embedded co-occurrence recommendations. |
+| `co_occurrence_recommendations.source_item` | string | User item used as the recommendation seed. |
+| `co_occurrence_recommendations.co_items` | array<object> | Recommended co-purchased items. |
+| `co_occurrence_recommendations.co_items.item` | string | Recommended item ID. |
+| `co_occurrence_recommendations.co_items.count` | int | Co-purchase frequency. |
+| `updated_at` | date | Last MongoDB load timestamp. |
 
-Embedding limit:
+Embedding limits:
 
 ```text
 Up to 20 source items per user.
 Up to 5 co-occurring items per source item.
 ```
 
-Example shape:
+Example document:
 
 ```json
 {
@@ -408,11 +498,19 @@ co_occurrence_recommendations.source_item
 co_occurrence_recommendations.co_items.item
 ```
 
-### Global Market Basket Schema: `market_basket_pairs`
+Single-query profile lookup:
 
-Each document stores one pair of products that appeared together in purchase sessions. This collection is still kept as the global co-occurrence source, while the user-specific subset is embedded inside `user_profiles.co_occurrence_recommendations`.
+```javascript
+db.user_profiles.findOne({ _id: "User_12762" })
+```
 
-Collection:
+---
+
+### Collection 2: `market_basket_pairs`
+
+This collection stores global product-pair co-occurrence counts. It is kept as a fallback source when an item is not embedded in a user's profile.
+
+Collection name:
 
 ```text
 ecommerce_recommendation.market_basket_pairs
@@ -420,16 +518,16 @@ ecommerce_recommendation.market_basket_pairs
 
 Schema:
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `_id` | string | Yes | MongoDB primary key using the format `item_a::item_b`. |
-| `item_a` | string | Yes | First product ID in the sorted product pair. |
-| `item_b` | string | Yes | Second product ID in the sorted product pair. |
-| `items` | array<string> | Yes | Two-item array containing both product IDs. Used for pair lookup queries. |
-| `count` | int | Yes | Number of sessions where both products were purchased together. |
-| `updated_at` | date | Yes | UTC timestamp for when the pair was last loaded into MongoDB. |
+| Field | Type | Description |
+| --- | --- | --- |
+| `_id` | string | Pair key using `item_a::item_b`. |
+| `item_a` | string | First product ID in the sorted pair. |
+| `item_b` | string | Second product ID in the sorted pair. |
+| `items` | array<string> | Two-item array used for pair lookup. |
+| `count` | int | Number of sessions where both products were purchased together. |
+| `updated_at` | date | Last MongoDB load timestamp. |
 
-Example shape:
+Example document:
 
 ```json
 {
@@ -450,9 +548,13 @@ items
 count
 ```
 
-## How to Run the Current Pipeline
+---
 
-Install dependencies from the project root:
+## How to Run
+
+### 1. Create and activate a Python environment
+
+PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -461,78 +563,320 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Start Hadoop:
+Linux/macOS/WSL:
 
-```powershell
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+---
+
+### 2. Start Hadoop
+
+```bash
 cd docker-hadoop
 docker compose up -d
 cd ..
 ```
 
-Run market basket analysis:
+Check containers:
 
-```powershell
+```bash
+docker ps
+```
+
+Useful web UIs:
+
+| Service | URL |
+| --- | --- |
+| NameNode | http://localhost:9870 |
+| DataNode | http://localhost:9864 |
+| ResourceManager | http://localhost:8088 |
+| NodeManager | http://localhost:8042 |
+| HistoryServer | http://localhost:8188 |
+
+---
+
+### 3. Load the dataset into HDFS
+
+Create the input directory:
+
+```bash
+docker exec namenode hdfs dfs -mkdir -p /user/hadoop/ecommerce_input
+```
+
+Copy the local dataset into the NameNode container:
+
+```bash
+docker cp data/raw/ecommerce_logs.csv namenode:/tmp/ecommerce_logs.csv
+```
+
+Put the dataset into HDFS:
+
+```bash
+docker exec namenode hdfs dfs -put -f /tmp/ecommerce_logs.csv /user/hadoop/ecommerce_input/ecommerce_logs.csv
+```
+
+Verify upload:
+
+```bash
+docker exec namenode hdfs dfs -ls -h /user/hadoop/ecommerce_input
+```
+
+---
+
+### 4. Run Spark jobs
+
+Market basket analysis:
+
+```bash
 spark-submit src/01_market_basket.py
 ```
 
-Run user affinity aggregation:
+User affinity aggregation:
 
-```powershell
+```bash
 spark-submit src/02_user_affinity.py
 ```
 
-Run user source-items aggregation:
+User source-items aggregation:
 
-```powershell
+```bash
 spark-submit src/03a_build_user_source_items_spark.py
 ```
 
-Start MongoDB:
+Verify HDFS outputs:
 
-```powershell
+```bash
+docker exec namenode hdfs dfs -ls /user/hadoop/market_basket_output
+docker exec namenode hdfs dfs -ls /user/hadoop/user_affinity_output
+docker exec namenode hdfs dfs -ls /user/hadoop/user_source_items_output
+```
+
+---
+
+### 5. Start MongoDB
+
+```bash
 docker compose -f docker-compose.mongo.yml up -d
 ```
 
-Load the Spark outputs into MongoDB:
+Check MongoDB container:
 
-```powershell
+```bash
+docker ps
+```
+
+---
+
+### 6. Load Spark outputs into MongoDB
+
+```bash
 python src/03_load_to_mongodb.py
 ```
+
+This creates and populates:
+
+```text
+ecommerce_recommendation.user_profiles
+ecommerce_recommendation.market_basket_pairs
+```
+
+---
+
+### 7. Run cart abandonment recovery
+
+Run this after MongoDB has been loaded with user profiles:
+
+```bash
+python src/04_cart_abandonment.py
+```
+
+Verify output:
+
+```bash
+docker exec namenode hdfs dfs -ls /user/hadoop/cart_abandonment_output
+```
+
+Preview output:
+
+```bash
+docker exec namenode hdfs dfs -cat /user/hadoop/cart_abandonment_output/part-* | head -5
+```
+
+---
+
+## Query Demo
+
+File:
+
+```text
+src/05_query_demo_script.py
+```
+
+Purpose:
+
+Fetch recommendation data from MongoDB for a given `user_id` and `item_id`.
+
+Command format:
+
+```bash
+python src/05_query_demo_script.py <user_id> <item_id>
+```
+
+JSON mode:
+
+```bash
+python src/05_query_demo_script.py <user_id> <item_id> --json
+```
+
+Example:
+
+```bash
+python src/05_query_demo_script.py User_12762 ITEM_4482 --json
+```
+
+Example output:
+
+```json
+{
+  "found_user": true,
+  "found_embedded_source_item": true,
+  "found_item_recommendations": true,
+  "used_global_fallback": false,
+  "user_id": "User_12762",
+  "item_id": "ITEM_4482",
+  "profile_lookup_ms": 3.342,
+  "global_lookup_ms": 0,
+  "total_lookup_ms": 3.342,
+  "top_categories": [
+    {
+      "rank": 1,
+      "category": "Clothing",
+      "score": 121
+    },
+    {
+      "rank": 2,
+      "category": "Toys",
+      "score": 120
+    },
+    {
+      "rank": 3,
+      "category": "Home",
+      "score": 109
+    }
+  ],
+  "recommendations": [
+    {
+      "item": "ITEM_1885",
+      "count": 2
+    },
+    {
+      "item": "ITEM_112",
+      "count": 1
+    }
+  ]
+}
+```
+
+The script first checks embedded recommendations inside `user_profiles`. If the requested item is not embedded for the user, it falls back to the global `market_basket_pairs` collection.
+
+---
+
+## Cart Abandonment Results
+
+The cart abandonment job produced the following run summary:
+
+| Metric | Value |
+| --- | ---: |
+| Abandoned sessions | 861,577 |
+| Abandoned cart items | 1,339,231 |
+| MongoDB user profiles loaded | 25,000 |
+| `High_Discount` flags | 881,632 |
+| `Standard_Reminder` flags | 457,599 |
+
+Flag distribution:
+
+```text
+High_Discount: 881632
+Standard_Reminder: 457599
+```
+
+Output path:
+
+```text
+hdfs://localhost:9000/user/hadoop/cart_abandonment_output
+```
+
+HDFS verification showed `_SUCCESS` plus 17 JSON part files.
+
+---
+
+## Useful HDFS Checks
+
+List uploaded input:
+
+```bash
+docker exec namenode hdfs dfs -ls -h /user/hadoop/ecommerce_input
+```
+
+Preview market basket output:
+
+```bash
+docker exec namenode hdfs dfs -cat /user/hadoop/market_basket_output/part-* | head -20
+```
+
+Preview user affinity output:
+
+```bash
+docker exec namenode hdfs dfs -cat /user/hadoop/user_affinity_output/part-* | head -20
+```
+
+Preview user source-items output:
+
+```bash
+docker exec namenode hdfs dfs -cat /user/hadoop/user_source_items_output/part-* | head -20
+```
+
+Preview cart abandonment output:
+
+```bash
+docker exec namenode hdfs dfs -cat /user/hadoop/cart_abandonment_output/part-* | head -20
+```
+
+Remove an old output directory before rerunning a job:
+
+```bash
+docker exec namenode hdfs dfs -rm -r /user/hadoop/<output_directory>
+```
+
+---
 
 ## Current Status
 
 Completed:
 
-- Hadoop Docker environment prepared.
-- Dataset loaded into HDFS.
-- Market basket Spark job implemented.
-- User affinity Spark job implemented.
-- User source-items Spark job implemented.
-- Spark outputs stored in HDFS for ingestion.
-- MongoDB service added.
-- MongoDB ingestion script implemented.
-- Recommendation-oriented MongoDB collections created.
-- Denormalized `user_profiles` documents now embed both top categories and co-occurrence recommendations for single-query retrieval.
+- Local Hadoop Docker environment prepared.
+- Raw dataset loaded into HDFS.
+- Spark market basket analysis implemented.
+- Spark user affinity aggregation implemented.
+- Spark user source-items aggregation implemented.
+- MongoDB Docker Compose service added.
+- MongoDB ingestion implemented.
+- Denormalized `user_profiles` collection implemented.
+- Global `market_basket_pairs` collection implemented.
+- Standalone recommendation query demo implemented.
+- Cart abandonment recovery job implemented.
+- Cart abandonment output generated in HDFS.
 
-Not completed yet:
+---
 
-- `src/04_cart_abandonment.py` is currently empty.
-- Cart abandonment analysis still needs to be implemented.
+## Notes
 
-## Suggested Next Step
-
-The next logical feature is cart abandonment analysis. It should identify sessions where a user added products to cart but did not purchase them later in the same session. The output could be stored in MongoDB as another collection, for example:
-
-```text
-cart_abandonment_events
-```
-
-Useful fields would include:
-
-- `session_id`
-- `user_id`
-- `product_id`
-- `category`
-- `cart_timestamp`
-- `was_purchased`
-- `updated_at`
+- The project uses MongoDB as the selected NoSQL option.
+- User recommendation data is denormalized into `user_profiles` to support single-query retrieval.
+- `market_basket_pairs` is retained as a global fallback source for item co-occurrence recommendations.
+- Cart abandonment recovery depends on MongoDB user profiles, so run `03_load_to_mongodb.py` before `04_cart_abandonment.py`.
