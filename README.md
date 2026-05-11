@@ -117,7 +117,6 @@ Instant recommendation lookup by user_id and item_id
 |   |-- 03_load_to_mongodb.py
 |   |-- 04_cart_abandonment.py
 |   `-- 05_query_demo_script.py
-|-- HADOOP_HDFS_DATA_LOADING_GUIDE.md
 |-- requirements.txt
 `-- README.md
 ```
