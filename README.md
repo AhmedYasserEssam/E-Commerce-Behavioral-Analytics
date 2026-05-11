@@ -132,6 +132,24 @@ Expected local dataset path:
 data/raw/ecommerce_logs.csv
 ```
 
+Download the dataset from:
+
+```text
+https://drive.google.com/drive/folders/1MQKAUk6lZ82Naxpz3YqZAWwnP9pQJPmr?usp=drive_link
+```
+
+Place the downloaded CSV file in:
+
+```text
+data/raw/
+```
+
+The project expects the file to be named:
+
+```text
+ecommerce_logs.csv
+```
+
 Expected HDFS dataset path:
 
 ```text
@@ -160,7 +178,7 @@ Important fields used by the jobs:
 | `product_id` | Identifies items for product-pair analysis. |
 | `product_metadata` | Used to extract product category information. |
 
-> The raw dataset is intentionally not committed to GitHub if it is large. Place it under `data/raw/ecommerce_logs.csv` locally, then load it into HDFS.
+> The raw dataset is intentionally not committed to GitHub if it is large. Download it from the Google Drive link above, place it under `data/raw/ecommerce_logs.csv` locally, then load it into HDFS.
 
 ---
 
